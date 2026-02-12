@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::destination::Destination;
 use crate::error::EtlResult;
-use crate::types::{Event, TableId, TableRow};
+use crate::types::{Cell, Event, TableId, TableRow};
 
 #[derive(Debug)]
 struct Inner {
@@ -122,8 +123,18 @@ impl Destination for MemoryDestination {
         info!(
             table_id = table_id.0,
             row_count = table_rows.len(),
-            "writing table rows"
+            "INITIAL COPY: writing table rows"
         );
+
+        for (i, row) in table_rows.iter().enumerate() {
+            info!(
+                table_id = table_id.0,
+                row_index = i,
+                row = %format_row(row),
+                "INITIAL COPY: row"
+            );
+        }
+
         inner.table_rows.insert(table_id, table_rows);
 
         Ok(())
@@ -133,8 +144,118 @@ impl Destination for MemoryDestination {
         let mut inner = self.inner.lock().await;
 
         info!(event_count = events.len(), "writing events");
+
+        for event in &events {
+            match event {
+                Event::Begin(e) => {
+                    info!(
+                        commit_lsn = %e.commit_lsn,
+                        "BEGIN"
+                    );
+                }
+                Event::Commit(e) => {
+                    info!(
+                        commit_lsn = %e.commit_lsn,
+                        "COMMIT"
+                    );
+                }
+                Event::Insert(e) => {
+                    info!(
+                        table_id = e.table_id.0,
+                        row = %format_row(&e.table_row),
+                        "INSERT"
+                    );
+                }
+                Event::Update(e) => {
+                    let old = e
+                        .old_table_row
+                        .as_ref()
+                        .map(|(_, row)| format_row(row))
+                        .unwrap_or_else(|| "<unavailable>".to_string());
+                    info!(
+                        table_id = e.table_id.0,
+                        new_row = %format_row(&e.table_row),
+                        old_row = %old,
+                        "UPDATE"
+                    );
+                }
+                Event::Delete(e) => {
+                    let old = e
+                        .old_table_row
+                        .as_ref()
+                        .map(|(_, row)| format_row(row))
+                        .unwrap_or_else(|| "<unavailable>".to_string());
+                    info!(
+                        table_id = e.table_id.0,
+                        old_row = %old,
+                        "DELETE"
+                    );
+                }
+                Event::Truncate(e) => {
+                    info!(
+                        table_ids = ?e.rel_ids,
+                        "TRUNCATE"
+                    );
+                }
+                Event::Relation(e) => {
+                    let columns: Vec<&str> = e
+                        .table_schema
+                        .column_schemas
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect();
+                    info!(
+                        table = %format!("{}.{}", e.table_schema.name.schema, e.table_schema.name.name),
+                        table_id = e.table_schema.id.0,
+                        columns = ?columns,
+                        "RELATION"
+                    );
+                }
+                Event::Unsupported => {
+                    info!("UNSUPPORTED event");
+                }
+            }
+        }
+
         inner.events.extend(events);
 
         Ok(())
+    }
+}
+
+/// Formats a [`TableRow`] as a human-readable string of cell values.
+fn format_row(row: &TableRow) -> String {
+    let mut buf = String::from("[");
+    for (i, cell) in row.values.iter().enumerate() {
+        if i > 0 {
+            buf.push_str(", ");
+        }
+        let _ = write!(buf, "{}", format_cell(cell));
+    }
+    buf.push(']');
+    buf
+}
+
+/// Formats a single [`Cell`] value as a concise string representation.
+fn format_cell(cell: &Cell) -> String {
+    match cell {
+        Cell::Null => "NULL".to_string(),
+        Cell::Bool(v) => v.to_string(),
+        Cell::String(v) => format!("'{v}'"),
+        Cell::I16(v) => v.to_string(),
+        Cell::I32(v) => v.to_string(),
+        Cell::U32(v) => v.to_string(),
+        Cell::I64(v) => v.to_string(),
+        Cell::F32(v) => v.to_string(),
+        Cell::F64(v) => v.to_string(),
+        Cell::Numeric(v) => format!("{v:?}"),
+        Cell::Date(v) => v.to_string(),
+        Cell::Time(v) => v.to_string(),
+        Cell::Timestamp(v) => v.to_string(),
+        Cell::TimestampTz(v) => v.to_string(),
+        Cell::Uuid(v) => v.to_string(),
+        Cell::Json(v) => v.to_string(),
+        Cell::Bytes(v) => format!("<{} bytes>", v.len()),
+        Cell::Array(v) => format!("{v:?}"),
     }
 }
