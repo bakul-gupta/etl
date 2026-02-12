@@ -1,0 +1,24 @@
+destination:
+  memory: ~
+
+pipeline:
+  id: 1
+  publication_name: "etl_publication"
+  pg_connection:
+    host: "localhost"
+    port: 5433
+    name: "yugabyte"
+    username: "yugabyte"
+    password: "yugabyte"
+    tls:
+      enabled: false
+      trusted_root_certs: ""
+  batch:
+    max_size: 1000
+    max_fill_ms: 5000
+  table_error_retry_delay_ms: 10000
+  table_error_retry_max_attempts: 5
+  max_table_sync_workers: 4
+  table_sync_copy:
+    type: "include_all_tables"
+  invalidated_slot_behavior: "error"

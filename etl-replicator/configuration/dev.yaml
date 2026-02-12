@@ -1,0 +1,2 @@
+# Dev environment overrides (inherits from base.yaml)
+# All base settings are used as-is for local development.
