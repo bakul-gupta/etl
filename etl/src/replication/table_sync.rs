@@ -334,8 +334,9 @@ where
     };
 
     // We mark this worker as `SyncWait` (in memory only) to signal the apply worker that we are
-    // ready to start catchup. We pass the snapshot LSN so the apply worker can use
-    // max(snapshot_lsn, current_lsn) when setting the Catchup LSN.
+    // ready to start catchup. We pass the snapshot LSN so the apply worker can determine when
+    // to transition to Catchup (once it sees a commit with end_lsn >= snapshot_lsn, it uses
+    // that commit's timestamp as the catchup target).
     {
         let mut inner = table_sync_worker_state.lock().await;
         inner

@@ -15,6 +15,7 @@ pub enum TableReplicationState {
     SyncDone {
         #[serde(with = "lsn_serde")]
         lsn: PgLsn,
+        commit_time: i64,
     },
     Ready,
     Errored {
@@ -463,22 +464,26 @@ mod tests {
 
         // Test SyncDone
         let lsn = "0/1000000".parse::<PgLsn>().unwrap();
-        let sync_done = TableReplicationState::SyncDone { lsn };
+        let commit_time = 728_553_600_000_000i64;
+        let sync_done = TableReplicationState::SyncDone { lsn, commit_time };
         let json = serde_json::to_value(&sync_done).unwrap();
         assert_eq!(
             json,
             serde_json::json!({
                 "type": "sync_done",
-                "lsn": "0/1000000"
+                "lsn": "0/1000000",
+                "commit_time": commit_time
             })
         );
 
         let deserialized: TableReplicationState = serde_json::from_value(json).unwrap();
         if let TableReplicationState::SyncDone {
             lsn: deserialized_lsn,
+            commit_time: deserialized_commit_time,
         } = deserialized
         {
             assert_eq!(deserialized_lsn, lsn);
+            assert_eq!(deserialized_commit_time, commit_time);
         } else {
             panic!("Expected SyncDone variant");
         }
