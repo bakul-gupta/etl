@@ -812,8 +812,7 @@ where
             && should_include_event
         {
             self.state.events_batch.push(event);
-            self.state
-                .update_last_commit(result.end_lsn, result.end_commit_timestamp);
+            self.state.update_last_commit(result.end_lsn, result.end_commit_timestamp);
         }
 
         let mut action = result.action;
@@ -1332,20 +1331,10 @@ where
     ) -> EtlResult<ApplyLoopAction> {
         match &mut self.worker_context {
             WorkerContext::Apply(ctx) => {
-                apply_worker::process_syncing_tables_after_commit_event(
-                    ctx,
-                    lsn,
-                    commit_timestamp,
-                )
-                .await
+                apply_worker::process_syncing_tables_after_commit_event(ctx, lsn, commit_timestamp).await
             }
             WorkerContext::TableSync(ctx) => {
-                table_sync_worker::process_syncing_tables_after_commit_event(
-                    ctx,
-                    lsn,
-                    commit_timestamp,
-                )
-                .await
+                table_sync_worker::process_syncing_tables_after_commit_event(ctx, lsn, commit_timestamp).await
             }
         }
     }
@@ -1383,20 +1372,10 @@ where
 
         match &mut self.worker_context {
             WorkerContext::Apply(ctx) => {
-                apply_worker::process_syncing_tables_after_batch_flush(
-                    ctx,
-                    current_lsn,
-                    current_commit_timestamp,
-                )
-                .await
+                apply_worker::process_syncing_tables_after_batch_flush(ctx, current_lsn, current_commit_timestamp).await
             }
             WorkerContext::TableSync(ctx) => {
-                table_sync_worker::process_syncing_tables_after_batch_flush(
-                    ctx,
-                    current_lsn,
-                    current_commit_timestamp,
-                )
-                .await
+                table_sync_worker::process_syncing_tables_after_batch_flush(ctx, current_lsn, current_commit_timestamp).await
             }
         }
     }
@@ -1431,20 +1410,10 @@ where
 
         match &mut self.worker_context {
             WorkerContext::Apply(ctx) => {
-                apply_worker::process_syncing_tables_when_idle(
-                    ctx,
-                    current_lsn,
-                    current_commit_timestamp,
-                )
-                .await
+                apply_worker::process_syncing_tables_when_idle(ctx, current_lsn, current_commit_timestamp).await
             }
             WorkerContext::TableSync(ctx) => {
-                table_sync_worker::process_syncing_tables_when_idle(
-                    ctx,
-                    current_lsn,
-                    current_commit_timestamp,
-                )
-                .await
+                table_sync_worker::process_syncing_tables_when_idle(ctx, current_lsn, current_commit_timestamp).await
             }
         }
     }
@@ -1619,9 +1588,7 @@ mod apply_worker {
 
                     worker_state_guard
                         .set_and_store(
-                            TableReplicationPhase::Catchup {
-                                commit_time: catchup_commit_time,
-                            },
+                            TableReplicationPhase::Catchup { commit_time: catchup_commit_time },
                             &ctx.store,
                         )
                         .await?;
@@ -1793,10 +1760,7 @@ mod apply_worker {
                 "checking table with active worker after batch flush",
             );
 
-            if let TableReplicationPhase::SyncDone {
-                lsn: sync_done_lsn, ..
-            } = phase
-            {
+            if let TableReplicationPhase::SyncDone { lsn: sync_done_lsn, .. } = phase {
                 if current_lsn >= sync_done_lsn {
                     info!(
                         worker_type = %WorkerType::Apply,
@@ -1828,9 +1792,7 @@ mod apply_worker {
             );
 
             match table_replication_phase {
-                TableReplicationPhase::SyncDone {
-                    lsn: sync_done_lsn, ..
-                } => {
+                TableReplicationPhase::SyncDone { lsn: sync_done_lsn, .. } => {
                     if current_lsn >= sync_done_lsn {
                         info!(
                             worker_type = %WorkerType::Apply,
@@ -1982,9 +1944,7 @@ mod apply_worker {
 
                     worker_state_guard
                         .set_and_store(
-                            TableReplicationPhase::Catchup {
-                                commit_time: catchup_commit_time,
-                            },
+                            TableReplicationPhase::Catchup { commit_time: catchup_commit_time },
                             &ctx.store,
                         )
                         .await?;
@@ -2041,9 +2001,7 @@ mod apply_worker {
                         }
                     }
                 }
-                TableReplicationPhase::SyncDone {
-                    lsn: sync_done_lsn, ..
-                } => {
+                TableReplicationPhase::SyncDone { lsn: sync_done_lsn, .. } => {
                     if current_lsn >= sync_done_lsn {
                         info!(
                             worker_type = %WorkerType::Apply,
@@ -2084,9 +2042,7 @@ mod apply_worker {
             );
 
             match table_replication_phase {
-                TableReplicationPhase::SyncDone {
-                    lsn: sync_done_lsn, ..
-                } => {
+                TableReplicationPhase::SyncDone { lsn: sync_done_lsn, .. } => {
                     if current_lsn >= sync_done_lsn {
                         info!(
                             worker_type = %WorkerType::Apply,
@@ -2221,10 +2177,7 @@ mod table_sync_worker {
 
         // Check if catchup commit time target reached.
         let inner = ctx.table_sync_worker_state.lock().await;
-        if let TableReplicationPhase::Catchup {
-            commit_time: catchup_commit_time,
-        } = inner.replication_phase()
-        {
+        if let TableReplicationPhase::Catchup { commit_time: catchup_commit_time} = inner.replication_phase() {
             if commit_timestamp >= catchup_commit_time {
                 info!(
                     %worker_type,
@@ -2301,10 +2254,7 @@ mod table_sync_worker {
         let mut inner = ctx.table_sync_worker_state.lock().await;
         let phase = inner.replication_phase();
 
-        if let TableReplicationPhase::Catchup {
-            commit_time: catchup_commit_time,
-        } = phase
-        {
+        if let TableReplicationPhase::Catchup { commit_time: catchup_commit_time} = phase {
             if commit_timestamp >= catchup_commit_time {
                 info!(
                     %worker_type,
@@ -2316,10 +2266,7 @@ mod table_sync_worker {
 
                 inner
                     .set_and_store(
-                        TableReplicationPhase::SyncDone {
-                            lsn: current_lsn,
-                            commit_time: commit_timestamp,
-                        },
+                        TableReplicationPhase::SyncDone { lsn: current_lsn, commit_time: commit_timestamp },
                         &ctx.state_store,
                     )
                     .await?;
