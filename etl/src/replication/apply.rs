@@ -291,6 +291,8 @@ struct HandleMessageResult {
     event: Option<Event>,
     /// Set to a commit message's end_lsn value, [`None`] otherwise.
     end_lsn: Option<PgLsn>,
+    /// Set to a commit message's timestamp value, [`None`] otherwise.
+    end_commit_timestamp: Option<i64>,
     /// Set when a batch should be ended earlier than the normal batching parameters.
     end_batch: Option<EndBatch>,
     /// Set when the table has encountered an error.
@@ -328,6 +330,10 @@ impl HandleMessageResult {
 struct ApplyLoopState {
     /// The highest LSN received from the [`end_lsn`] field of a [`Commit`] message.
     last_commit_end_lsn: Option<PgLsn>,
+    /// The commit timestamp of the last [`Commit`] message in the current batch.
+    last_commit_timestamp: Option<i64>,
+    /// The commit timestamp of the last [`Commit`] message that was flushed to the destination.
+    last_flush_commit_timestamp: Option<i64>,
     /// The LSN of the commit WAL entry of the transaction that is currently being processed.
     remote_final_lsn: Option<PgLsn>,
     /// The current replication progress tracking received and flushed LSN positions.
@@ -355,6 +361,8 @@ impl ApplyLoopState {
     fn new(replication_progress: ReplicationProgress, max_batch_fill_duration: Duration) -> Self {
         Self {
             last_commit_end_lsn: None,
+            last_commit_timestamp: None,
+            last_flush_commit_timestamp: None,
             remote_final_lsn: None,
             replication_progress,
             events_batch: Vec::new(),
@@ -386,15 +394,21 @@ impl ApplyLoopState {
         debug!("reset batch flush timer");
     }
 
-    /// Updates the last commit end LSN to track transaction boundaries.
-    fn update_last_commit_end_lsn(&mut self, end_lsn: Option<PgLsn>) {
+    /// Updates the last commit end LSN and commit timestamp to track transaction boundaries.
+    fn update_last_commit(
+        &mut self,
+        end_lsn: Option<PgLsn>,
+        commit_timestamp: Option<i64>,
+    ) {
         match (self.last_commit_end_lsn, end_lsn) {
             (None, Some(end_lsn)) => {
                 self.last_commit_end_lsn = Some(end_lsn);
+                self.last_commit_timestamp = commit_timestamp;
             }
             (Some(old_last_commit_end_lsn), Some(end_lsn)) => {
                 if end_lsn > old_last_commit_end_lsn {
                     self.last_commit_end_lsn = Some(end_lsn);
+                    self.last_commit_timestamp = commit_timestamp;
                 }
             }
             (_, None) => {}
@@ -883,7 +897,7 @@ where
                 .events_batch_bytes
                 .saturating_add(event.size_hint());
             self.state.events_batch.push(event);
-            self.state.update_last_commit_end_lsn(result.end_lsn);
+            self.state.update_last_commit(result.end_lsn, result.end_commit_timestamp);
         }
 
         let mut action = result.action;
@@ -1165,10 +1179,11 @@ where
         }
 
         let end_lsn = PgLsn::from(message.end_lsn());
+        let commit_timestamp = message.timestamp();
 
         // Process syncing tables after commit (worker-specific behavior).
         let mut action = self
-            .process_syncing_tables_after_commit_event(end_lsn)
+            .process_syncing_tables_after_commit_event(end_lsn, commit_timestamp)
             .await?;
 
         // If shutdown was deferred (see [`ShutdownState::Deferred`]), we merge
@@ -1185,6 +1200,7 @@ where
         let mut result = HandleMessageResult {
             event: Some(Event::Commit(event)),
             end_lsn: Some(end_lsn),
+            end_commit_timestamp: Some(commit_timestamp),
             action,
             ..Default::default()
         };
@@ -1430,13 +1446,14 @@ where
     async fn process_syncing_tables_after_commit_event(
         &mut self,
         lsn: PgLsn,
+        commit_timestamp: i64,
     ) -> EtlResult<ApplyLoopAction> {
         match &mut self.worker_context {
             WorkerContext::Apply(ctx) => {
-                apply_worker::process_syncing_tables_after_commit_event(ctx, lsn).await
+                apply_worker::process_syncing_tables_after_commit_event(ctx, lsn, commit_timestamp).await
             }
             WorkerContext::TableSync(ctx) => {
-                table_sync_worker::process_syncing_tables_after_commit_event(ctx, lsn).await
+                table_sync_worker::process_syncing_tables_after_commit_event(ctx, lsn, commit_timestamp).await
             }
         }
     }
@@ -1451,6 +1468,12 @@ where
             return Ok(ApplyLoopAction::Continue);
         };
 
+        // Track the commit timestamp of the flushed batch for sync decisions.
+        let current_commit_timestamp = self.state.last_commit_timestamp.take();
+        if let Some(ts) = current_commit_timestamp {
+            self.state.last_flush_commit_timestamp = Some(ts);
+        }
+
         // Update replication progress to notify PostgreSQL of durable flush. Only reports progress
         // up to the last completed transaction, which may cause duplicates on restart for partial
         // transactions. Destinations must handle at-least-once delivery semantics.
@@ -1462,15 +1485,16 @@ where
         info!(
             worker_type = %self.worker_context.worker_type(),
             %current_lsn,
+            ?current_commit_timestamp,
             "processing syncing tables after batch flush"
         );
 
         match &mut self.worker_context {
             WorkerContext::Apply(ctx) => {
-                apply_worker::process_syncing_tables_after_batch_flush(ctx, current_lsn).await
+                apply_worker::process_syncing_tables_after_batch_flush(ctx, current_lsn, current_commit_timestamp).await
             }
             WorkerContext::TableSync(ctx) => {
-                table_sync_worker::process_syncing_tables_after_batch_flush(ctx, current_lsn).await
+                table_sync_worker::process_syncing_tables_after_batch_flush(ctx, current_lsn, current_commit_timestamp).await
             }
         }
     }
@@ -1494,19 +1518,21 @@ where
 
         // Use effective flush LSN to report last received LSN when idle.
         let current_lsn = self.state.effective_flush_lsn();
+        let current_commit_timestamp = self.state.last_flush_commit_timestamp;
 
         debug!(
             worker_type = %self.worker_context.worker_type(),
             %current_lsn,
+            ?current_commit_timestamp,
             "processing syncing tables outside transaction"
         );
 
         match &mut self.worker_context {
             WorkerContext::Apply(ctx) => {
-                apply_worker::process_syncing_tables_when_idle(ctx, current_lsn).await
+                apply_worker::process_syncing_tables_when_idle(ctx, current_lsn, current_commit_timestamp).await
             }
             WorkerContext::TableSync(ctx) => {
-                table_sync_worker::process_syncing_tables_when_idle(ctx, current_lsn).await
+                table_sync_worker::process_syncing_tables_when_idle(ctx, current_lsn, current_commit_timestamp).await
             }
         }
     }
@@ -1565,7 +1591,7 @@ mod apply_worker {
         ) -> bool {
             match phase {
                 TableReplicationPhase::Ready => true,
-                TableReplicationPhase::SyncDone { lsn } => lsn <= remote_final_lsn,
+                TableReplicationPhase::SyncDone { lsn, .. } => lsn <= remote_final_lsn,
                 _ => false,
             }
         }
@@ -1592,10 +1618,12 @@ mod apply_worker {
     /// Processes syncing tables after commit.
     ///
     /// Spawns new table sync workers and triggers catchup when encountering SyncWait.
+    /// Uses the commit timestamp from the COMMIT message for the catchup target.
     /// Does NOT perform SyncDone → Ready transitions.
     pub(super) async fn process_syncing_tables_after_commit_event<S, D>(
         ctx: &mut ApplyWorkerContext<S, D>,
         current_lsn: PgLsn,
+        commit_timestamp: i64,
     ) -> EtlResult<ApplyLoopAction>
     where
         S: StateStore + SchemaStore + Clone + Send + Sync + 'static,
@@ -1607,6 +1635,7 @@ mod apply_worker {
                 table_id,
                 table_replication_phase,
                 current_lsn,
+                commit_timestamp,
             )
             .await?;
 
@@ -1620,13 +1649,14 @@ mod apply_worker {
 
     /// Processes a single syncing table after commit.
     ///
-    /// Handles SyncWait → Catchup transitions and spawns new workers.
+    /// Handles SyncWait → Catchup transitions using commit timestamp and spawns new workers.
     /// Does NOT handle SyncDone → Ready transitions.
     async fn process_single_syncing_table_after_commit<S, D>(
         ctx: &mut ApplyWorkerContext<S, D>,
         table_id: TableId,
         table_replication_phase: TableReplicationPhase,
         current_lsn: PgLsn,
+        commit_timestamp: i64,
     ) -> EtlResult<ApplyLoopAction>
     where
         S: StateStore + SchemaStore + Clone + Send + Sync + 'static,
@@ -1643,28 +1673,41 @@ mod apply_worker {
                 table_id = table_id.0,
                 ?phase,
                 %current_lsn,
+                commit_timestamp,
                 "checking table with active worker after commit",
             );
 
             match phase {
                 TableReplicationPhase::SyncWait { lsn: snapshot_lsn } => {
-                    // The catchup lsn is determined via max since it could be that the table sync worker
-                    // is started from a lsn which is far in the future compared to where the apply worker
-                    // is.
-                    let catchup_lsn = snapshot_lsn.max(current_lsn);
+                    // We only transition SyncWait -> Catchup once the apply worker has processed
+                    // a commit whose end_lsn >= snapshot_lsn. The catchup target is expressed as
+                    // the commit timestamp of that commit.
+                    if current_lsn < snapshot_lsn {
+                        debug!(
+                            worker_type = %WorkerType::Apply,
+                            table_id = table_id.0,
+                            %current_lsn,
+                            %snapshot_lsn,
+                            "apply worker has not yet reached snapshot lsn, deferring sync_wait -> catchup",
+                        );
+
+                        return Ok(ApplyLoopAction::Continue);
+                    }
+
+                    let catchup_commit_time = commit_timestamp;
 
                     info!(
                         worker_type = %WorkerType::Apply,
                         table_id = table_id.0,
                         %current_lsn,
                         %snapshot_lsn,
-                        %catchup_lsn,
+                        catchup_commit_time,
                         "transitioning sync_wait -> catchup",
                     );
 
                     worker_state_guard
                         .set_and_store(
-                            TableReplicationPhase::Catchup { lsn: catchup_lsn },
+                            TableReplicationPhase::Catchup { commit_time: catchup_commit_time },
                             &ctx.store,
                         )
                         .await?;
@@ -1672,7 +1715,7 @@ mod apply_worker {
                     info!(
                         worker_type = %WorkerType::Apply,
                         table_id = table_id.0,
-                        %catchup_lsn,
+                        catchup_commit_time,
                         "table sync worker entered catchup phase, apply worker blocking until table sync worker reaches sync_done",
                     );
 
@@ -1719,11 +1762,12 @@ mod apply_worker {
                         }
                     }
                 }
-                TableReplicationPhase::SyncDone { lsn } => {
+                TableReplicationPhase::SyncDone { lsn, commit_time } => {
                     debug!(
                         worker_type = %WorkerType::Apply,
                         table_id = table_id.0,
                         sync_done_lsn = %lsn,
+                        sync_done_commit_time = commit_time,
                         "table in sync_done state, will transition to ready after batch flush",
                     );
                 }
@@ -1746,11 +1790,12 @@ mod apply_worker {
 
             // No active worker exists, potentially start a new worker.
             match table_replication_phase {
-                TableReplicationPhase::SyncDone { lsn } => {
+                TableReplicationPhase::SyncDone { lsn, commit_time } => {
                     debug!(
                         worker_type = %WorkerType::Apply,
                         table_id = table_id.0,
                         sync_done_lsn = %lsn,
+                        sync_done_commit_time = commit_time,
                         "table in sync_done state, will transition to ready after batch flush",
                     );
                 }
@@ -1781,6 +1826,7 @@ mod apply_worker {
     pub(super) async fn process_syncing_tables_after_batch_flush<S, D>(
         ctx: &mut ApplyWorkerContext<S, D>,
         current_lsn: PgLsn,
+        _current_commit_timestamp: Option<i64>,
     ) -> EtlResult<ApplyLoopAction>
     where
         S: StateStore + SchemaStore + Clone + Send + Sync + 'static,
@@ -1833,7 +1879,7 @@ mod apply_worker {
                 "checking table with active worker after batch flush",
             );
 
-            if let TableReplicationPhase::SyncDone { lsn: sync_done_lsn } = phase {
+            if let TableReplicationPhase::SyncDone { lsn: sync_done_lsn, .. } = phase {
                 if current_lsn >= sync_done_lsn {
                     info!(
                         worker_type = %WorkerType::Apply,
@@ -1865,7 +1911,7 @@ mod apply_worker {
             );
 
             match table_replication_phase {
-                TableReplicationPhase::SyncDone { lsn: sync_done_lsn } => {
+                TableReplicationPhase::SyncDone { lsn: sync_done_lsn, .. } => {
                     if current_lsn >= sync_done_lsn {
                         info!(
                             worker_type = %WorkerType::Apply,
@@ -1914,9 +1960,13 @@ mod apply_worker {
     ///
     /// Handles `SyncWait → Catchup` and `SyncDone → Ready` transitions, and spawns workers.
     /// Only called when outside a transaction and the batch is empty.
+    ///
+    /// Note: SyncWait → Catchup requires a commit timestamp and is only performed when
+    /// `current_commit_timestamp` is available (i.e. at least one commit has been flushed).
     pub(super) async fn process_syncing_tables_when_idle<S, D>(
         ctx: &mut ApplyWorkerContext<S, D>,
         current_lsn: PgLsn,
+        current_commit_timestamp: Option<i64>,
     ) -> EtlResult<ApplyLoopAction>
     where
         S: StateStore + SchemaStore + Clone + Send + Sync + 'static,
@@ -1928,6 +1978,7 @@ mod apply_worker {
                 table_id,
                 table_replication_phase,
                 current_lsn,
+                current_commit_timestamp,
             )
             .await?;
 
@@ -1948,6 +1999,7 @@ mod apply_worker {
         table_id: TableId,
         table_replication_phase: TableReplicationPhase,
         current_lsn: PgLsn,
+        current_commit_timestamp: Option<i64>,
     ) -> EtlResult<ApplyLoopAction>
     where
         S: StateStore + SchemaStore + Clone + Send + Sync + 'static,
@@ -1968,28 +2020,50 @@ mod apply_worker {
                 table_id = table_id.0,
                 ?phase,
                 %current_lsn,
+                ?current_commit_timestamp,
                 "checking table with active worker when idle",
             );
 
             match phase {
                 TableReplicationPhase::SyncWait { lsn: snapshot_lsn } => {
-                    // The catchup lsn is determined via max since it could be that the table sync worker
-                    // is started from a lsn which is far in the future compared to where the apply worker
-                    // is.
-                    let catchup_lsn = snapshot_lsn.max(current_lsn);
+                    // SyncWait -> Catchup requires a commit timestamp. When idle we use the last
+                    // flushed commit timestamp. If no commit has been flushed yet, we defer.
+                    let Some(commit_ts) = current_commit_timestamp else {
+                        debug!(
+                            worker_type = %WorkerType::Apply,
+                            table_id = table_id.0,
+                            "no commit timestamp available yet, deferring sync_wait -> catchup",
+                        );
+
+                        return Ok(ApplyLoopAction::Continue);
+                    };
+
+                    if current_lsn < snapshot_lsn {
+                        debug!(
+                            worker_type = %WorkerType::Apply,
+                            table_id = table_id.0,
+                            %current_lsn,
+                            %snapshot_lsn,
+                            "apply worker has not yet reached snapshot lsn, deferring sync_wait -> catchup",
+                        );
+
+                        return Ok(ApplyLoopAction::Continue);
+                    }
+
+                    let catchup_commit_time = commit_ts;
 
                     info!(
                         worker_type = %WorkerType::Apply,
                         table_id = table_id.0,
                         %current_lsn,
                         %snapshot_lsn,
-                        %catchup_lsn,
+                        catchup_commit_time,
                         "transitioning sync_wait -> catchup",
                     );
 
                     worker_state_guard
                         .set_and_store(
-                            TableReplicationPhase::Catchup { lsn: catchup_lsn },
+                            TableReplicationPhase::Catchup { commit_time: catchup_commit_time },
                             &ctx.store,
                         )
                         .await?;
@@ -1997,7 +2071,7 @@ mod apply_worker {
                     info!(
                         worker_type = %WorkerType::Apply,
                         table_id = table_id.0,
-                        %catchup_lsn,
+                        catchup_commit_time,
                         "table sync worker entered catchup phase, apply worker blocking until table sync worker reaches sync_done",
                     );
 
@@ -2046,7 +2120,7 @@ mod apply_worker {
                         }
                     }
                 }
-                TableReplicationPhase::SyncDone { lsn: sync_done_lsn } => {
+                TableReplicationPhase::SyncDone { lsn: sync_done_lsn, .. } => {
                     if current_lsn >= sync_done_lsn {
                         info!(
                             worker_type = %WorkerType::Apply,
@@ -2087,7 +2161,7 @@ mod apply_worker {
             );
 
             match table_replication_phase {
-                TableReplicationPhase::SyncDone { lsn: sync_done_lsn } => {
+                TableReplicationPhase::SyncDone { lsn: sync_done_lsn, .. } => {
                     if current_lsn >= sync_done_lsn {
                         info!(
                             worker_type = %WorkerType::Apply,
@@ -2210,26 +2284,28 @@ mod table_sync_worker {
 
     /// Processes syncing tables after commit.
     ///
-    /// Validates whether catchup position has been reached.
+    /// Validates whether the catchup commit time target has been reached.
     /// If so, returns Complete to signal end batch.
     /// Does NOT update state (that happens after flush).
     pub(super) async fn process_syncing_tables_after_commit_event<S>(
         ctx: &TableSyncWorkerContext<S>,
         current_lsn: PgLsn,
+        commit_timestamp: i64,
     ) -> EtlResult<ApplyLoopAction> {
         let worker_type = WorkerType::TableSync {
             table_id: ctx.table_id,
         };
 
-        // Check if catchup position reached, if so, signal end batch but don't update the state yet.
+        // Check if catchup commit time target reached.
         let inner = ctx.table_sync_worker_state.lock().await;
-        if let TableReplicationPhase::Catchup { lsn: catchup_lsn } = inner.replication_phase() {
-            if current_lsn >= catchup_lsn {
+        if let TableReplicationPhase::Catchup { commit_time: catchup_commit_time} = inner.replication_phase() {
+            if commit_timestamp >= catchup_commit_time {
                 info!(
                     %worker_type,
-                    %catchup_lsn,
+                    catchup_commit_time,
+                    commit_timestamp,
                     %current_lsn,
-                    "catchup target lsn reached after commit, requesting early batch flush before transitioning to sync_done",
+                    "catchup target commit time reached after commit, requesting early batch flush before transitioning to sync_done",
                 );
 
                 return Ok(ApplyLoopAction::Complete);
@@ -2237,10 +2313,10 @@ mod table_sync_worker {
 
             debug!(
                 %worker_type,
-                %catchup_lsn,
+                catchup_commit_time,
+                commit_timestamp,
                 %current_lsn,
-                remaining_lsn = %(u64::from(catchup_lsn) - u64::from(current_lsn)),
-                "catchup in progress, target lsn not yet reached",
+                "catchup in progress, target commit time not yet reached",
             );
         }
 
@@ -2249,60 +2325,69 @@ mod table_sync_worker {
 
     /// Processes syncing tables after batch flush.
     ///
-    /// Validates whether catchup position has been reached.
+    /// Validates whether the catchup commit time target has been reached.
     /// If so, transitions to SyncDone and returns Complete.
     pub(super) async fn process_syncing_tables_after_batch_flush<S>(
         ctx: &mut TableSyncWorkerContext<S>,
         current_lsn: PgLsn,
+        current_commit_timestamp: Option<i64>,
     ) -> EtlResult<ApplyLoopAction>
     where
         S: StateStore + Clone + Send + Sync + 'static,
     {
-        try_complete_catchup(ctx, current_lsn).await
+        try_complete_catchup(ctx, current_lsn, current_commit_timestamp).await
     }
 
     /// Processes syncing tables outside transaction.
     ///
-    /// If catchup position reached, transitions to SyncDone.
+    /// If catchup commit time target reached, transitions to SyncDone.
     /// Only called when outside a transaction and the batch is empty.
     pub(super) async fn process_syncing_tables_when_idle<S>(
         ctx: &mut TableSyncWorkerContext<S>,
         current_lsn: PgLsn,
+        current_commit_timestamp: Option<i64>,
     ) -> EtlResult<ApplyLoopAction>
     where
         S: StateStore + Clone + Send + Sync + 'static,
     {
-        try_complete_catchup(ctx, current_lsn).await
+        try_complete_catchup(ctx, current_lsn, current_commit_timestamp).await
     }
 
     /// Attempts to complete catchup and transition to SyncDone.
     ///
-    /// If catchup position has been reached, transitions to SyncDone and returns Complete.
+    /// If the catchup commit time target has been reached, transitions to SyncDone
+    /// (storing both the current LSN and commit timestamp) and returns Complete.
     async fn try_complete_catchup<S>(
         ctx: &mut TableSyncWorkerContext<S>,
         current_lsn: PgLsn,
+        current_commit_timestamp: Option<i64>,
     ) -> EtlResult<ApplyLoopAction>
     where
         S: StateStore + Clone + Send + Sync + 'static,
     {
+        let Some(commit_timestamp) = current_commit_timestamp else {
+            return Ok(ApplyLoopAction::Continue);
+        };
+
         let worker_type = WorkerType::TableSync {
             table_id: ctx.table_id,
         };
         let mut inner = ctx.table_sync_worker_state.lock().await;
         let phase = inner.replication_phase();
 
-        if let TableReplicationPhase::Catchup { lsn: catchup_lsn } = phase {
-            if current_lsn >= catchup_lsn {
+        if let TableReplicationPhase::Catchup { commit_time: catchup_commit_time} = phase {
+            if commit_timestamp >= catchup_commit_time {
                 info!(
                     %worker_type,
-                    %catchup_lsn,
+                    catchup_commit_time,
+                    commit_timestamp,
                     %current_lsn,
-                    "catchup target lsn reached, transitioning catchup -> sync_done",
+                    "catchup target commit time reached, transitioning catchup -> sync_done",
                 );
 
                 inner
                     .set_and_store(
-                        TableReplicationPhase::SyncDone { lsn: current_lsn },
+                        TableReplicationPhase::SyncDone { lsn: current_lsn, commit_time: commit_timestamp },
                         &ctx.state_store,
                     )
                     .await?;
@@ -2310,6 +2395,7 @@ mod table_sync_worker {
                 info!(
                     %worker_type,
                     %current_lsn,
+                    commit_timestamp,
                     "table sync worker completed: now in sync_done state, apply worker will be unblocked",
                 );
 
@@ -2318,10 +2404,10 @@ mod table_sync_worker {
 
             debug!(
                 %worker_type,
-                %catchup_lsn,
+                catchup_commit_time,
+                commit_timestamp,
                 %current_lsn,
-                remaining_lsn = %(u64::from(catchup_lsn) - u64::from(current_lsn)),
-                "catchup in progress, target lsn not yet reached",
+                "catchup in progress, target commit time not yet reached",
             );
         }
 

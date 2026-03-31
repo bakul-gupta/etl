@@ -83,9 +83,12 @@ async fn test_state_store_operations() {
     let state = store.get_table_replication_state(table_id).await.unwrap();
     assert_eq!(state, Some(data_sync_phase.clone()));
 
-    // Test SyncDone state with LSN
+    // Test SyncDone state with LSN and commit time
     let lsn = "0/1000000".parse::<PgLsn>().unwrap();
-    let sync_done_phase = TableReplicationPhase::SyncDone { lsn };
+    let sync_done_phase = TableReplicationPhase::SyncDone {
+        lsn,
+        commit_time: 728_553_600_000_000i64,
+    };
     store
         .update_table_replication_state(table_id, sync_done_phase.clone())
         .await
@@ -491,7 +494,10 @@ async fn test_state_transitions_and_history() {
         .unwrap();
 
     let lsn = "0/2000000".parse::<PgLsn>().unwrap();
-    let sync_done_phase = TableReplicationPhase::SyncDone { lsn };
+    let sync_done_phase = TableReplicationPhase::SyncDone {
+        lsn,
+        commit_time: 728_553_600_000_000i64,
+    };
     store
         .update_table_replication_state(table_id, sync_done_phase.clone())
         .await

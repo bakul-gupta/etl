@@ -122,40 +122,41 @@ pub enum TableReplicationPhase {
     ///
     /// On every transaction boundary the apply worker checks if any table-sync
     /// worker is in the `SyncWait` state and pauses itself if it finds any. It resumes
-    /// only when the table sync worker has caught up with the `Catchup`'s LSN.
+    /// only when the table sync worker has caught up with `Catchup`'s commit time target.
     ///
     /// This phase is stored in memory only and not persisted to the state store.
     SyncWait {
         /// The LSN of the snapshot used for the initial table copy.
         ///
         /// This LSN represents the consistent point from which the table sync worker
-        /// will start streaming changes. The apply worker will use `max(this lsn, current_lsn)`
-        /// when setting the Catchup LSN to ensure no data loss, following PostgreSQL's pattern.
+        /// will start streaming changes. The apply worker waits until it sees a commit
+        /// with `end_lsn >= this lsn`, then uses that commit's timestamp as the catchup
+        /// target for the table sync worker.
         lsn: PgLsn,
     },
     /// Set by the apply worker when it is paused. The table-sync worker waits
     /// for the apply worker to set this state after setting the state to `SyncWait`.
     ///
-    /// This phase is stored in memory only and not persisted to the state store
+    /// This phase is stored in memory only and not persisted to the state store.
     Catchup {
-        /// The lsn to catch up before shutting down the table sync worker and handing over streaming
-        /// to the apply worker.
-        lsn: PgLsn,
+        /// The commit timestamp to catch up to before shutting down the table sync worker
+        /// and handing over streaming to the apply worker.
+        commit_time: i64,
     },
 
     /// Set by the table-sync worker when catch-up phase is completed and table-sync
-    /// worker has caught up with the apply worker's lsn position.
+    /// worker has caught up with the apply worker's commit time position.
     ///
     /// The apply worker is waiting on this phase to be reached before continuing to process other
     /// tables or events in the apply loop.
     SyncDone {
-        /// The lsn up to which the table-sync worker has caught up.
-        ///
-        /// This LSN is guaranteed to be >= `Catchup.lsn`.
+        /// The LSN up to which the table-sync worker has caught up.
         lsn: PgLsn,
+        /// The commit timestamp up to which the table-sync worker has caught up.
+        commit_time: i64,
     },
     /// Set by apply worker when it has caught up with the table-sync worker's
-    /// catch up lsn position. Tables with this state have successfully run their
+    /// catch-up position. Tables with this state have successfully run their
     /// initial table copy and catch-up phases and any changes to them will now
     /// be applied by the apply worker only.
     Ready,
@@ -189,8 +190,10 @@ impl fmt::Display for TableReplicationPhase {
             Self::DataSync => write!(f, "data_sync"),
             Self::FinishedCopy => write!(f, "finished_copy"),
             Self::SyncWait { lsn } => write!(f, "sync_wait({lsn})"),
-            Self::Catchup { lsn } => write!(f, "catchup({lsn})"),
-            Self::SyncDone { lsn } => write!(f, "sync_done({lsn})"),
+            Self::Catchup { commit_time } => write!(f, "catchup(commit_time={commit_time})"),
+            Self::SyncDone { lsn, commit_time } => {
+                write!(f, "sync_done({lsn}, commit_time={commit_time})")
+            }
             Self::Ready => write!(f, "ready"),
             Self::Errored { reason, .. } => write!(f, "errored({reason})"),
         }
@@ -242,8 +245,8 @@ impl TryFrom<state::TableReplicationStateRow> for TableReplicationPhase {
             state::TableReplicationState::Init => Ok(TableReplicationPhase::Init),
             state::TableReplicationState::DataSync => Ok(TableReplicationPhase::DataSync),
             state::TableReplicationState::FinishedCopy => Ok(TableReplicationPhase::FinishedCopy),
-            state::TableReplicationState::SyncDone { lsn } => {
-                Ok(TableReplicationPhase::SyncDone { lsn })
+            state::TableReplicationState::SyncDone { lsn, commit_time } => {
+                Ok(TableReplicationPhase::SyncDone { lsn, commit_time })
             }
             state::TableReplicationState::Ready => Ok(TableReplicationPhase::Ready),
             state::TableReplicationState::Errored {

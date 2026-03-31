@@ -690,17 +690,21 @@ impl PgReplicationClient {
     }
 
     /// Deletes a replication slot, optionally failing when the slot does not exist.
+    ///
+    /// Tries `DROP_REPLICATION_SLOT ... WAIT` first and, if the server does not
+    /// support `WAIT` (e.g. YugabyteDB), falls back to a plain
+    /// `DROP_REPLICATION_SLOT` without `WAIT`.
     async fn delete_slot_internal(&self, slot_name: &str, fail_if_missing: bool) -> EtlResult<()> {
         info!(slot_name, "deleting replication slot");
 
         // Do not convert the query or the options to lowercase, see comment in `create_slot_internal`.
-        let query = format!(
+        let query_with_wait = format!(
             r#"DROP_REPLICATION_SLOT {} WAIT;"#,
             quote_identifier(slot_name)
         );
 
         let delete_result =
-            match tokio::time::timeout(DELETE_SLOT_TIMEOUT, self.client.simple_query(&query)).await
+            match tokio::time::timeout(DELETE_SLOT_TIMEOUT, self.client.simple_query(&query_with_wait)).await
             {
                 Ok(result) => result,
                 Err(err) => bail!(
@@ -713,6 +717,28 @@ impl PgReplicationClient {
                     source: err
                 ),
             };
+
+        // If the server does not support WAIT (e.g. YugabyteDB), retry without it.
+        let delete_result = match delete_result {
+            Err(ref err)
+                if err
+                    .to_string()
+                    .contains("waiting for a replication slot is not yet supported") =>
+            {
+                warn!(
+                    slot_name,
+                    "server does not support WAIT for slot deletion, retrying without WAIT"
+                );
+
+                let query_without_wait = format!(
+                    r#"DROP_REPLICATION_SLOT {};"#,
+                    quote_identifier(slot_name)
+                );
+
+                self.client.simple_query(&query_without_wait).await
+            }
+            other => other,
+        };
 
         match delete_result {
             Ok(_) => {

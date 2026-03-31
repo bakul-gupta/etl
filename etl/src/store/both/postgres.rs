@@ -73,8 +73,8 @@ impl TryFrom<TableReplicationPhase> for state::TableReplicationState {
             TableReplicationPhase::Init => Ok(state::TableReplicationState::Init),
             TableReplicationPhase::DataSync => Ok(state::TableReplicationState::DataSync),
             TableReplicationPhase::FinishedCopy => Ok(state::TableReplicationState::FinishedCopy),
-            TableReplicationPhase::SyncDone { lsn } => {
-                Ok(state::TableReplicationState::SyncDone { lsn })
+            TableReplicationPhase::SyncDone { lsn, commit_time } => {
+                Ok(state::TableReplicationState::SyncDone { lsn, commit_time })
             }
             TableReplicationPhase::Ready => Ok(state::TableReplicationState::Ready),
             TableReplicationPhase::Errored {
